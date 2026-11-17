@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { line, readOne } = require("../mcp-check.js");
+const { line, readOne, check } = require("../mcp-check.js");
 
 function json(part) {
   return JSON.parse(part.msg.toString("utf8"));
@@ -176,3 +176,80 @@ stdin.resume();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("check: good replies pass", () => {
+  assert.ok(check('{"jsonrpc":"2.0","id":1,"result":{}}', 1).msg);
+  assert.ok(check('{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}', 2).msg);
+});
+
+test("check: log line is skipped", () => {
+  const got = check('{"jsonrpc":"2.0","method":"notifications/message","params":{}}', 1);
+  assert.equal(got.skip, true);
+});
+
+test("check: bad replies fail", () => {
+  assert.match(check("hello", 1).err, /not json/);
+  assert.match(check("null", 1).err, /not json-rpc/);
+  assert.match(check('{"jsonrpc":"2.0","id":5,"result":{}}', 1).err, /expected id 1/);
+  assert.match(check('{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"nope"}}', 1).err, /nope/);
+  assert.match(check('{"jsonrpc":"2.0","id":1}', 1).err, /no result/);
+  assert.match(check('{"jsonrpc":"2.0","id":2,"result":{}}', 2).err, /tools array/);
+});
+
+// one fake server, mode pick what kind of rubbish it send back for every request
+const badServer = `#!/usr/bin/env node
+const mode = process.argv[2];
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString("utf8");
+  const lines = buf.split("\\n");
+  buf = lines.pop();
+  for (const raw of lines) {
+    const msg = JSON.parse(raw);
+    if (msg.id === undefined) continue;
+    let reply = "";
+    if (mode === "garbage") reply = "hello not json";
+    if (mode === "error") reply = JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: "nope" } });
+    if (mode === "wrong-id") reply = JSON.stringify({ jsonrpc: "2.0", id: 99, result: { tools: [] } });
+    process.stdout.write(reply + "\\n");
+  }
+});
+process.stdin.resume();
+`;
+
+const expectErr = {
+  garbage: /not json/,
+  error: /server error: nope/,
+  "wrong-id": /expected id 1, got 99/,
+};
+
+for (const mode of ["garbage", "error", "wrong-id"]) {
+  test(`cli fails on ${mode} reply`, { timeout: 3000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-check-"));
+    const server = path.join(dir, "server.js");
+    fs.writeFileSync(server, badServer);
+
+    const cmd = `${JSON.stringify(process.execPath)} ${JSON.stringify(server)} ${mode}`;
+    const cli = spawn(process.execPath, [path.join(__dirname, "..", "mcp-check.js"), cmd], {
+      env: { ...process.env, MCP_CHECK_TIMEOUT: "2000" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let err = "";
+    cli.stderr.on("data", (chunk) => {
+      err += chunk.toString("utf8");
+    });
+
+    try {
+      const code = await new Promise((resolve, reject) => {
+        cli.once("error", reject);
+        cli.once("close", resolve);
+      });
+
+      assert.equal(code, 1, err);
+      assert.match(err, expectErr[mode]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

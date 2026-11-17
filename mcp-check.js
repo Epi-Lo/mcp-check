@@ -28,6 +28,28 @@ function readOne(buf) {
   };
 }
 
+// last time anything not empty also count as pass, even rubbish or an error reply
+function check(raw, id) {
+  let msg;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return { err: `not json: ${raw.slice(0, 80)}` };
+  }
+
+  if (!msg || typeof msg !== "object") return { err: `not json-rpc: ${raw.slice(0, 80)}` };
+
+  // server can send log / notification anytime, that one is not our answer
+  if (msg.method) return { skip: true };
+
+  if (msg.id !== id) return { err: `expected id ${id}, got ${msg.id}` };
+  if (msg.error) return { err: `server error: ${msg.error.message || JSON.stringify(msg.error)}` };
+  if (!msg.result) return { err: `no result for id ${id}` };
+  if (id === 2 && !Array.isArray(msg.result.tools)) return { err: "tools/list did not give a tools array" };
+
+  return { msg };
+}
+
 function run(cmd, opts = {}) {
   if (!cmd) {
     console.error('usage: node mcp-check.js "node server.js"');
@@ -74,8 +96,20 @@ function run(cmd, opts = {}) {
         process.exit(1);
       }
 
-      console.log(part.msg.toString("utf8"));
       out = part.rest;
+      const raw = part.msg.toString("utf8");
+      const got = check(raw, gotInit ? 2 : 1);
+
+      if (got.skip) continue;
+      if (got.err) {
+        done = true;
+        clearTimeout(timeout);
+        console.error(got.err);
+        child.kill();
+        process.exit(1);
+      }
+
+      console.log(raw);
 
       if (!gotInit) {
         gotInit = true;
@@ -101,4 +135,4 @@ if (require.main === module) {
   run(process.argv.slice(2).join(" "));
 }
 
-module.exports = { line, readOne };
+module.exports = { line, readOne, check };
